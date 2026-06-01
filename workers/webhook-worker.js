@@ -378,8 +378,8 @@ async function enqueueRecalc(env, accountId, productId, reason) {
 }
 
 /**
- * Reserve stock + update balances + enqueue recalc,
- * using already-resolved listing mapping (no second DB lookup).
+ * Reserve stock + update balances using already-resolved listing mapping.
+ * Returns auto_recalc flag so the caller can batch/deduplicate recalc enqueues.
  */
 async function reserveFromResolvedListing(env, { orderId, orderLineItemId, listingId, qtySold, listing }) {
   const q = Math.max(1, Number(qtySold || 1));
@@ -408,7 +408,7 @@ async function reserveFromResolvedListing(env, { orderId, orderLineItemId, listi
     try {
       if (!listing?.product_id || !listing?.account_id) {
         console.log("Listing missing product/account mapping:", { listingIdStr, listing });
-        return { inserted: 0, account_id: null, product_id: null };
+        return { inserted: 0, account_id: null, product_id: null, auto_recalc: 0 };
       }
 
       const productId = Number(listing.product_id);
@@ -439,10 +439,7 @@ async function reserveFromResolvedListing(env, { orderId, orderLineItemId, listi
         ).bind(productId, reservedInc).run();
       }
 
-      // 4) ALWAYS trigger recalc
-      await enqueueRecalc(env, accountId, productId, "sale");
-
-      return { inserted, account_id: accountId, product_id: productId };
+      return { inserted, account_id: accountId, product_id: productId, auto_recalc: listing.auto_recalc ?? 0 };
     } catch (e) {
       if (attempt < maxAttempts && isRetryableD1(e)) {
         await sleep(150 * attempt + Math.floor(Math.random() * 150));
@@ -455,9 +452,9 @@ async function reserveFromResolvedListing(env, { orderId, orderLineItemId, listi
 
 /**
  * Process an ORDER_CONFIRMATION:
- * - resolve listing once (product_id/account_id/ups)
- * - optional TEST_MODE gate
- * - reserve + enqueue using resolved listing (no second lookup)
+ * - batches all listing lookups into a single DB call (avoiding N+1)
+ * - reserves stock per line item
+ * - deduplicates recalc enqueues by (account_id, product_id)
  */
 async function processOrderConfirmation({ env, bodyText }) {
   try {
@@ -482,7 +479,7 @@ async function processOrderConfirmation({ env, bodyText }) {
     const lineItems = order?.orderLineItems || [];
     if (!orderId || !Array.isArray(lineItems) || lineItems.length === 0) return;
 
-    // ---- TEST MODE (Change #1): config + log once ----
+    // ---- TEST MODE ----
     const TEST_PRODUCT_IDS = new Set([
       // 123,
       // 456,
@@ -490,23 +487,42 @@ async function processOrderConfirmation({ env, bodyText }) {
     const TEST_MODE = TEST_PRODUCT_IDS.size > 0;
     console.log("TEST_MODE:", TEST_MODE, "TEST_PRODUCT_IDS:", [...TEST_PRODUCT_IDS]);
 
+    // Collect valid line items and listing IDs first
+    const validItems = [];
+    const listingIdSet = new Set();
     for (const li of lineItems) {
       const orderLineItemId = li?.orderLineItemId;
       const listingId = li?.listingId;
       const qtySold = Number(li?.quantity ?? 1);
-
       if (!orderLineItemId || !listingId || !Number.isFinite(qtySold) || qtySold <= 0) continue;
+      validItems.push({ orderLineItemId, listingId: String(listingId), qtySold });
+      listingIdSet.add(String(listingId));
+    }
 
-      // ---- Change #2: single lookup for mapping + ups ----
-      const listing = await env.DB_INVENTORY.prepare(
-        `SELECT product_id, account_id, COALESCE(units_per_sale, 1) AS ups
-         FROM listings
-         WHERE ebay_item_number = ?
-         LIMIT 1`
-      ).bind(String(listingId)).first();
+    if (validItems.length === 0) return;
 
+    // ---- Single batch lookup for all listings ----
+    const idList = [...listingIdSet];
+    const placeholders = idList.map(() => '?').join(',');
+    const listingRows = await env.DB_INVENTORY.prepare(
+      `SELECT l.ebay_item_number, l.product_id, l.account_id, COALESCE(l.units_per_sale,1) AS ups, p.auto_recalc
+       FROM listings l
+       JOIN products p ON l.product_id = p.product_id
+       WHERE l.ebay_item_number IN (${placeholders})`
+    ).bind(...idList).all();
+
+    const listingMap = new Map();
+    for (const row of listingRows.results) {
+      listingMap.set(String(row.ebay_item_number), row);
+    }
+
+    // Track recalc pairs to deduplicate enqueues
+    const recalcPairs = new Map();
+
+    for (const li of validItems) {
+      const listing = listingMap.get(li.listingId);
       if (!listing) {
-        console.log("No matching listing for listingId:", listingId);
+        console.log("No matching listing for listingId:", li.listingId);
         continue;
       }
 
@@ -519,13 +535,25 @@ async function processOrderConfirmation({ env, bodyText }) {
         continue;
       }
 
-      await reserveFromResolvedListing(env, {
+      const result = await reserveFromResolvedListing(env, {
         orderId,
-        orderLineItemId,
-        listingId,
-        qtySold,
+        orderLineItemId: li.orderLineItemId,
+        listingId: li.listingId,
+        qtySold: li.qtySold,
         listing,
       });
+
+      if (result.auto_recalc === 1 && result.inserted > 0 && result.account_id) {
+        const key = `${result.account_id}:${result.product_id}`;
+        if (!recalcPairs.has(key)) {
+          recalcPairs.set(key, { account_id: result.account_id, product_id: result.product_id });
+        }
+      }
+    }
+
+    // Enqueue recalc once per unique (account_id, product_id) pair
+    for (const pair of recalcPairs.values()) {
+      await enqueueRecalc(env, pair.account_id, pair.product_id, "sale");
     }
   } catch (e) {
     console.log("processOrderConfirmation failed:", e);

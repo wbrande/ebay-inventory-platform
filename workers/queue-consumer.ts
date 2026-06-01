@@ -177,31 +177,33 @@ async function setListingQuantity(env: Env, accountId: number, itemId: string, q
  * Returns rows + a snapshot of qty_reserved used.
  */
 async function computeDesired(env: Env, accountId: number, productId: number) {
-  const sb = await env.DB_INVENTORY.prepare(
-    `SELECT qty_on_hand, qty_reserved
-     FROM stock_balance
-     WHERE product_id = ?`
-  )
-    .bind(productId)
-    .first<{ qty_on_hand: number; qty_reserved: number }>();
+  // Run both queries concurrently — they are independent
+  const [sb, listings] = await Promise.all([
+    env.DB_INVENTORY.prepare(
+      `SELECT qty_on_hand, qty_reserved
+       FROM stock_balance
+       WHERE product_id = ?`
+    )
+      .bind(productId)
+      .first<{ qty_on_hand: number; qty_reserved: number }>(),
+    env.DB_INVENTORY.prepare(
+      `SELECT listing_id, ebay_item_number, units_per_sale, last_pushed_qty
+       FROM listings
+       WHERE account_id = ? AND product_id = ?`
+    )
+      .bind(accountId, productId)
+      .all<{
+        listing_id: number;
+        ebay_item_number: string;
+        units_per_sale: number;
+        last_pushed_qty: number | null;
+      }>(),
+  ]);
 
   const qtyOnHand = Number(sb?.qty_on_hand ?? 0);
   const qtyReserved = Number(sb?.qty_reserved ?? 0);
 
   const availableUnits = Math.max(0, qtyOnHand - qtyReserved);
-
-  const listings = await env.DB_INVENTORY.prepare(
-    `SELECT listing_id, ebay_item_number, units_per_sale, last_pushed_qty
-     FROM listings
-     WHERE account_id = ? AND product_id = ?`
-  )
-    .bind(accountId, productId)
-    .all<{
-      listing_id: number;
-      ebay_item_number: string;
-      units_per_sale: number;
-      last_pushed_qty: number | null;
-    }>();
 
   const rows = listings.results.map((l) => {
     const ups = Math.max(1, Number(l.units_per_sale || 1));
@@ -234,18 +236,6 @@ async function resolveReserved(env: Env, productId: number, reservedSnapshot: nu
     .run();
 }
 
-async function updateLastPushed(env: Env, listingId: number, pushedQty: number) {
-  await env.DB_INVENTORY.prepare(
-    `UPDATE listings
-     SET last_pushed_qty = ?,
-         last_pushed_at  = datetime('now'),
-         updated_at      = datetime('now')
-     WHERE listing_id = ?`
-  )
-    .bind(Math.trunc(pushedQty), listingId)
-    .run();
-}
-
 /**
  * Process exactly one work item (account_id, product_id).
  * Deletes recalc_queue row only if requested_at is unchanged (prevents wiping newer triggers).
@@ -271,8 +261,21 @@ async function processWorkItem(env: Env, accountId: number, productId: number) {
 
   for (const r of toPush) {
     await setListingQuantity(env, accountId, r.ebay_item_number, r.desired_qty);
-    await updateLastPushed(env, r.listing_id, r.desired_qty);
     updated++;
+  }
+
+  // Batch all DB updates for successfully pushed listings (1 DB round trip instead of N)
+  if (updated > 0) {
+    const stmts = toPush.map((r) =>
+      env.DB_INVENTORY.prepare(
+        `UPDATE listings
+         SET last_pushed_qty = ?,
+             last_pushed_at  = datetime('now'),
+             updated_at      = datetime('now')
+         WHERE listing_id = ?`
+      ).bind(Math.trunc(r.desired_qty), r.listing_id)
+    );
+    await env.DB_INVENTORY.batch(stmts);
   }
 
   await resolveReserved(env, productId, qtyReservedSnapshot);
